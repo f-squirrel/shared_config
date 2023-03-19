@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -11,63 +13,62 @@
 #include <cstdint>
 #include <sys/types.h>
 
-class NonCopiableNonMovable {
+class NonCopyable {
 public:
-    NonCopiableNonMovable()                              = default;
-    NonCopiableNonMovable(const NonCopiableNonMovable &) = delete;
-    NonCopiableNonMovable(NonCopiableNonMovable &&)      = delete;
+    NonCopyable()                          = default;
+    NonCopyable(NonCopyable &&)            = default;
+    NonCopyable &operator=(NonCopyable &&) = default;
 
-    NonCopiableNonMovable &operator=(const NonCopiableNonMovable &) = delete;
-    NonCopiableNonMovable &operator=(NonCopiableNonMovable &&)      = delete;
+    NonCopyable(const NonCopyable &)            = delete;
+    NonCopyable &operator=(const NonCopyable &) = delete;
 
-    ~NonCopiableNonMovable() = default;
+    ~NonCopyable() = default;
 };
 
-class InnerConfig /*: private NonCopiableNonMovable*/ {
+class InnerConfig : private NonCopyable {
 public:
     InnerConfig(const std::string &name, u_int16_t version)
         : name_{name}, version_{version} {}
 
-    // InnerConfig(const InnerConfig &) = delete;
-    // InnerConfig& operator = (const InnerConfig &) = delete;
-
-    const std::string &name() const { return name_; }
-    uint16_t version() const { return version_; }
+    [[nodiscard]] const std::string &name() const { return name_; }
+    [[nodiscard]] uint16_t version() const { return version_; }
 
 private:
     std::string name_;
     uint16_t version_;
 };
 
-class Config : private NonCopiableNonMovable {
+class Config {
 public:
-    Config(std::weak_ptr<const InnerConfig> inner_config)
+    Config(const std::shared_ptr<const InnerConfig> &inner_config)
         : inner_config_{inner_config} {}
 
-    const std::string &name() const { return lock()->name(); }
-    uint16_t version() const { return lock()->version(); }
+    [[nodiscard]] const std::string &name() const { return load()->name(); }
+    [[nodiscard]] uint16_t version() const { return load()->version(); }
 
 private:
-    std::shared_ptr<const InnerConfig> lock() const {
-        auto sp = inner_config_.lock();
-        assert(sp);
-        return sp;
+    [[nodiscard]] const std::shared_ptr<const InnerConfig> load() const {
+        auto ptr = std::atomic_load(&inner_config_);
+        assert(ptr);
+        return ptr;
     }
 
-private:
-    std::weak_ptr<const InnerConfig> inner_config_;
+    const std::shared_ptr<const InnerConfig> &inner_config_;
 };
 
-class ConfigManager : private NonCopiableNonMovable {
+class ConfigManager : private NonCopyable {
 public:
     ConfigManager(const std::string config_path,
                   std::chrono::milliseconds reload_interval)
         : config_path_{config_path}, reload_interval_{reload_interval} {
 
-        last_used_    = read();
-        inner_config_ = std::make_shared<InnerConfig>(parse(last_used_));
-        stop_         = false;
-        watcher_      = std::thread([&]() { watch(); });
+        last_used_   = std::move(read().value());
+        auto new_ptr = std::make_shared<const InnerConfig>(
+            std::move(parse(last_used_).value()));
+        std::atomic_store(&inner_config_, new_ptr);
+
+        stop_    = false;
+        watcher_ = std::thread([&]() { watch(); });
     }
 
     ~ConfigManager() {
@@ -75,11 +76,8 @@ public:
         watcher_.join();
     }
 
-    ConfigManager(const ConfigManager &) = delete;
-    ConfigManager(ConfigManager &&)      = delete;
-
-    ConfigManager &operator=(const ConfigManager &) = delete;
-    ConfigManager &operator=(ConfigManager &&)      = delete;
+    ConfigManager(ConfigManager &&)            = delete;
+    ConfigManager &operator=(ConfigManager &&) = delete;
 
     Config get() const { return Config{inner_config_}; }
 
@@ -88,24 +86,33 @@ private:
         for (; !stop_; std::this_thread::sleep_for(reload_interval_)) {
             auto latest = read();
             if (latest != last_used_) {
-                inner_config_ = std::make_shared<InnerConfig>(parse(latest));
-                last_used_    = std::move(latest);
+                auto inner_config = parse(latest.value());
+                if (!inner_config.has_value()) {
+                    continue;
+                }
+                auto new_ptr = std::make_shared<const InnerConfig>(
+                    std::move(inner_config.value()));
+                std::atomic_store(&inner_config_, new_ptr);
+                last_used_ = std::move(latest.value());
             }
         }
     }
 
-    std::string read() const {
-        auto file   = std::ifstream{config_path_.c_str()};
+    [[nodiscard]] std::optional<std::string> read() const {
+        auto file = std::ifstream{config_path_.c_str()};
+        if (!file.is_open()) {
+            return {};
+        }
         auto latest = std::string{
             (std::istreambuf_iterator<std::string::value_type>(file)),
             std::istreambuf_iterator<std::string::value_type>()};
         file.close();
-        return latest;
+        return {latest};
     }
 
-    InnerConfig parse(const std::string &) const {
+    [[nodiscard]] std::optional<InnerConfig> parse(const std::string &) const {
         // TODO: implement deserialization from string
-        return InnerConfig{"name", 42};
+        return {InnerConfig{"name", 42}};
     }
 
 private:
