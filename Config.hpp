@@ -43,7 +43,7 @@ public:
     Config(const std::shared_ptr<const InnerConfig> &inner_config)
         : inner_config_{inner_config} {}
 
-    [[nodiscard]] const std::string &name() const { return load()->name(); }
+    [[nodiscard]] std::string name() const { return load()->name(); }
     [[nodiscard]] uint16_t version() const { return load()->version(); }
 
 private:
@@ -86,6 +86,7 @@ private:
         for (; !stop_; std::this_thread::sleep_for(reload_interval_)) {
             auto latest = read();
             if (latest != last_used_) {
+                std::cout << "reloaded\n";
                 auto inner_config = parse(latest.value());
                 if (!inner_config.has_value()) {
                     continue;
